@@ -1,0 +1,22 @@
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+dist/
+
+# Go workspace
+go.work
+
+# Build outputs
+filerename
+filerename.exe
+
+# Data files
+.filerename_backup/
+.filerename_resume.json
+_conflicts/
