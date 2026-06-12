@@ -1,0 +1,19 @@
+{
+  "algorithm": "MD5",
+  "generated_at": "2026-06-13T06:19:36+08:00",
+  "total_groups": 1,
+  "total_files": 2,
+  "total_waste_bytes": 42,
+  "groups": [
+    {
+      "hash": "bfbcc74137f74589ae58fa999b572e28",
+      "size_bytes": 21,
+      "file_count": 3,
+      "keep_file": "D:\\code\\TraeProjects\\1273\\testdup\\a.txt",
+      "duplicates": [
+        "D:\\code\\TraeProjects\\1273\\testdup\\b.txt",
+        "D:\\code\\TraeProjects\\1273\\testdup\\c.txt"
+      ]
+    }
+  ]
+}

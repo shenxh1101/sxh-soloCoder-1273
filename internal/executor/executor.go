@@ -216,51 +216,83 @@ func (e *Executor) Plan(files []*types.FileInfo) ([]*types.RenameAction, error) 
 }
 
 func (e *Executor) planSingle(f *types.FileInfo, index int) (*types.RenameAction, bool) {
-	newName := f.Name
+	currentName := f.Name
 	appliedAny := false
+	var steps []types.RuleStep
 
 	for _, rule := range e.rules {
+		before := currentName
 		result, applied, err := rule.Apply(f, index)
-		if err != nil {
-			continue
-		}
-		if applied {
-			newName = result
+		if err == nil && applied {
+			currentName = result
 			appliedAny = true
 		}
+		steps = append(steps, types.RuleStep{
+			Rule:    rule.Name(),
+			Before:  before,
+			After:   currentName,
+			Applied: err == nil && applied,
+		})
 	}
 
 	if e.plugins != nil {
-		result, applied, err := e.plugins.ApplyAll(f, index, newName)
+		before := currentName
+		result, applied, err := e.plugins.ApplyAll(f, index, currentName)
 		if err == nil && applied {
-			newName = result
+			currentName = result
 			appliedAny = true
 		}
+		steps = append(steps, types.RuleStep{
+			Rule:    "plugins",
+			Before:  before,
+			After:   currentName,
+			Applied: err == nil && applied,
+		})
 	}
 
 	targetDir := f.Dir
+	classifyApplied := false
 	if e.classifier != nil {
 		if dir, ok := e.classifier.Classify(f); ok {
 			targetDir = dir
 			appliedAny = true
+			classifyApplied = true
 		}
 	}
+	steps = append(steps, types.RuleStep{
+		Rule:    "classify",
+		Before:  f.Dir,
+		After:   targetDir,
+		Applied: classifyApplied,
+	})
 
 	if !appliedAny {
 		return nil, true
 	}
 
-	if newName == "" {
-		newName = f.Name
+	if currentName == "" {
+		currentName = f.Name
 	}
 
-	targetPath := filepath.Join(targetDir, newName+f.Ext)
+	targetPath := filepath.Join(targetDir, currentName+f.Ext)
+	beforeDedup := targetPath
+	dedupApplied := false
 	if e.dedup != nil {
-		targetPath = e.dedup.ResolveConflict(targetPath)
-		if targetPath == "" {
+		resolved := e.dedup.ResolveConflict(targetPath)
+		if resolved != targetPath && resolved != "" {
+			targetPath = resolved
+			dedupApplied = true
+		}
+		if resolved == "" {
 			return nil, true
 		}
 	}
+	steps = append(steps, types.RuleStep{
+		Rule:    "dedup",
+		Before:  beforeDedup,
+		After:   targetPath,
+		Applied: dedupApplied,
+	})
 
 	if targetPath == f.Path {
 		return nil, true
@@ -272,6 +304,7 @@ func (e *Executor) planSingle(f *types.FileInfo, index int) (*types.RenameAction
 		SourceFile: *f,
 		Operation:  types.OpRename,
 		Timestamp:  time.Now(),
+		Steps:      steps,
 	}
 	if targetDir != f.Dir {
 		action.Operation = types.OpMove

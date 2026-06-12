@@ -32,6 +32,14 @@ type RenameAction struct {
 	Timestamp   time.Time
 	Success     bool
 	Error       string
+	Steps       []RuleStep
+}
+
+type RuleStep struct {
+	Rule     string
+	Before   string
+	After    string
+	Applied  bool
 }
 
 type OperationType string
