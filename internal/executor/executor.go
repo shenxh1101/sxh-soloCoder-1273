@@ -296,10 +296,10 @@ func (e *Executor) saveResumeCheckpoint(force bool) {
 }
 
 func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (*ExecutorResult, error) {
+	startTime := time.Now()
 	result := &ExecutorResult{
 		Actions: actions,
 		Total:   len(actions),
-		Elapsed: time.Now(),
 	}
 
 	if len(actions) == 0 {
@@ -487,7 +487,7 @@ func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (
 	result.Failed = int(atomic.LoadInt32(&fail))
 	result.Skipped = int(atomic.LoadInt32(&skip))
 	result.Interrupted = atomic.LoadInt32(&interrupted) == 1
-	result.Elapsed = time.Since(result.Elapsed)
+	result.Elapsed = time.Since(startTime)
 	if e.progress != nil { e.progress.Finish() }
 
 	if !dryRun && result.Succeeded > 0 {

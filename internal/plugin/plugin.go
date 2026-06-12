@@ -67,8 +67,8 @@ func (pm *PluginManager) LoadPlugins(configs []types.PluginConfig) error {
 	return nil
 }
 
-func (pm *PluginManager) ApplyAll(f *types.FileInfo, index int) (string, bool, error) {
-	name := f.Name
+func (pm *PluginManager) ApplyAll(f *types.FileInfo, index int, currentName string) (string, bool, error) {
+	name := currentName
 	changed := false
 	for _, p := range pm.plugins {
 		newName, ok, err := p.Apply(f, index, name)

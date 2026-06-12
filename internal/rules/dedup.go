@@ -30,6 +30,10 @@ func NewDedupManager(cfg *types.DedupConfig) *DedupManager {
 	}
 }
 
+func (d *DedupManager) separator() string {
+	return "_"
+}
+
 func (d *DedupManager) ResolveConflict(targetPath string) string {
 	if !d.cfg.Enabled {
 		return targetPath
@@ -70,7 +74,7 @@ func (d *DedupManager) ResolveConflict(targetPath string) string {
 	default:
 		count++
 		d.seen[key] = count
-		newName := fmt.Sprintf("%s%s%s%d%s", name, d.cfg.Separator(), d.cfg.Suffix, count, ext)
+		newName := fmt.Sprintf("%s%s%s%d%s", name, d.separator(), d.cfg.Suffix, count, ext)
 		newPath := filepath.Join(dir, newName)
 		for {
 			if _, err := os.Stat(newPath); os.IsNotExist(err) {
@@ -80,7 +84,7 @@ func (d *DedupManager) ResolveConflict(targetPath string) string {
 			}
 			count++
 			d.seen[key] = count
-			newName = fmt.Sprintf("%s%s%s%d%s", name, d.cfg.Separator(), d.cfg.Suffix, count, ext)
+			newName = fmt.Sprintf("%s%s%s%d%s", name, d.separator(), d.cfg.Suffix, count, ext)
 			newPath = filepath.Join(dir, newName)
 		}
 	}
@@ -98,10 +102,6 @@ func (d *DedupManager) resolveInDir(path string) string {
 		count++
 		path = filepath.Join(dir, fmt.Sprintf("%s_%d%s", name, count, ext))
 	}
-}
-
-func (c *types.DedupConfig) Separator() string {
-	return "_"
 }
 
 type Classifier struct {
