@@ -19,12 +19,21 @@ import (
 )
 
 type Executor struct {
-	cfg       *config.Config
-	rules     []types.Rule
-	dedup     *rules.DedupManager
-	classifier *rules.Classifier
-	plugins   *plugin.PluginManager
-	progress  ProgressReporter
+	cfg         *config.Config
+	rules       []types.Rule
+	dedup       *rules.DedupManager
+	classifier  *rules.Classifier
+	plugins     *plugin.PluginManager
+	progress    ProgressReporter
+
+	resumeTaskID  string
+	resumeEnabled bool
+	resumePersist bool
+
+	resumeMu      sync.Mutex
+	resumeState   *types.ResumeState
+	resumeRM      *ResumeManager
+	lastSaveTime  time.Time
 }
 
 type ProgressReporter interface {
@@ -85,24 +94,38 @@ func (p *DefaultProgress) Phase() string {
 }
 
 type ExecutorResult struct {
-	Actions      []*types.RenameAction
-	Total        int
-	Succeeded    int
-	Failed       int
-	Skipped      int
-	Elapsed      time.Duration
-	HistoryID    string
+	Actions         []*types.RenameAction
+	Total           int
+	Succeeded       int
+	Failed          int
+	Skipped         int
+	Elapsed         time.Duration
+	HistoryID       string
 	DuplicateGroups map[string][]*types.FileInfo
-	Warnings     []string
+	Warnings        []string
+	Interrupted     bool
 }
 
 func NewExecutor(cfg *config.Config) *Executor {
-	return &Executor{cfg: cfg}
+	return &Executor{
+		cfg: cfg,
+		resumeEnabled: cfg.Global.Resume,
+		resumePersist: true,
+	}
 }
 
 func (e *Executor) WithProgress(p ProgressReporter) *Executor {
 	e.progress = p
 	return e
+}
+
+func (e *Executor) SetResumeInfo(taskID string, enabled bool, persist bool) {
+	e.resumeTaskID = taskID
+	e.resumeEnabled = enabled
+	e.resumePersist = persist
+	if enabled {
+		e.resumeRM = NewResumeManager("")
+	}
 }
 
 func (e *Executor) Initialize() error {
@@ -256,6 +279,22 @@ func (e *Executor) planSingle(f *types.FileInfo, index int) (*types.RenameAction
 	return action, false
 }
 
+func (e *Executor) saveResumeCheckpoint(force bool) {
+	if !e.resumeEnabled || !e.resumePersist || e.resumeState == nil || e.resumeRM == nil {
+		return
+	}
+	e.resumeMu.Lock()
+	defer e.resumeMu.Unlock()
+
+	now := time.Now()
+	if !force && now.Sub(e.lastSaveTime) < 500*time.Millisecond {
+		return
+	}
+	e.lastSaveTime = now
+	e.resumeState.LastUpdate = now
+	_ = e.resumeRM.Save(e.resumeState)
+}
+
 func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (*ExecutorResult, error) {
 	result := &ExecutorResult{
 		Actions: actions,
@@ -265,6 +304,25 @@ func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (
 
 	if len(actions) == 0 {
 		return result, nil
+	}
+
+	workers := e.cfg.Global.Workers
+	if workers <= 0 { workers = 32 }
+	dryRun := e.cfg.Global.DryRun || e.cfg.Global.Preview
+
+	if e.resumeEnabled && e.resumePersist && !dryRun {
+		e.resumeMu.Lock()
+		initProcessed := make([]string, 0, len(actions))
+		e.resumeState = &types.ResumeState{
+			TaskID:     e.resumeTaskID,
+			Progress:   0,
+			Total:      len(actions),
+			Processed:  initProcessed,
+			Failed:     make([]string, 0),
+			LastUpdate: time.Now(),
+		}
+		e.resumeMu.Unlock()
+		e.saveResumeCheckpoint(true)
 	}
 
 	if e.classifier != nil && e.cfg.Rename.Classify.CreateDirs {
@@ -282,10 +340,6 @@ func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (
 		}
 	}
 
-	workers := e.cfg.Global.Workers
-	if workers <= 0 { workers = 32 }
-	dryRun := e.cfg.Global.DryRun || e.cfg.Global.Preview
-
 	if e.progress != nil {
 		e.progress.SetPhase("Executing")
 		e.progress.Reset()
@@ -293,19 +347,42 @@ func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (
 	}
 
 	var (
-		wg     sync.WaitGroup
-		sem    = make(chan struct{}, workers)
-		mu     sync.Mutex
-		succ   int32
-		fail   int32
-		skip   int32
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, workers)
+		mu       sync.Mutex
+		succ     int32
+		fail     int32
+		skip     int32
+		interrupted int32
 	)
+
+	saveTrigger := make(chan struct{}, 1)
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				e.saveResumeCheckpoint(false)
+			case <-saveTrigger:
+				e.saveResumeCheckpoint(true)
+				return
+			case <-ctx.Done():
+				e.saveResumeCheckpoint(true)
+				return
+			}
+		}
+	}()
 
 	for _, action := range actions {
 		select {
 		case <-ctx.Done():
+			atomic.StoreInt32(&interrupted, 1)
 			break
 		default:
+		}
+		if atomic.LoadInt32(&interrupted) == 1 {
+			break
 		}
 		a := action
 		wg.Add(1)
@@ -317,10 +394,16 @@ func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (
 			if dryRun {
 				a.Executed = false
 				a.Success = true
-				mu.Lock()
 				atomic.AddInt32(&succ, 1)
-				mu.Unlock()
 				if e.progress != nil { e.progress.Increment(1) }
+				if e.resumeEnabled && e.resumePersist {
+					e.resumeMu.Lock()
+					if e.resumeState != nil {
+						e.resumeState.Processed = append(e.resumeState.Processed, a.SourcePath)
+						e.resumeState.Progress++
+					}
+					e.resumeMu.Unlock()
+				}
 				return
 			}
 
@@ -332,6 +415,10 @@ func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (
 				a.Error = err.Error()
 				atomic.AddInt32(&fail, 1)
 				result.Warnings = append(result.Warnings, fmt.Sprintf("%s: %v", a.SourcePath, err))
+				if e.resumeState != nil {
+					e.resumeState.Failed = append(e.resumeState.Failed, a.SourcePath)
+					e.resumeState.Progress++
+				}
 				mu.Unlock()
 				if e.progress != nil { e.progress.Increment(1) }
 				return
@@ -342,6 +429,24 @@ func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (
 				a.Success = false
 				a.Error = "target already exists"
 				atomic.AddInt32(&skip, 1)
+				if e.resumeState != nil {
+					e.resumeState.Processed = append(e.resumeState.Processed, a.SourcePath)
+					e.resumeState.Progress++
+				}
+				mu.Unlock()
+				if e.progress != nil { e.progress.Increment(1) }
+				return
+			}
+
+			if _, err := os.Stat(a.SourcePath); os.IsNotExist(err) {
+				mu.Lock()
+				a.Success = false
+				a.Error = "source not found (already processed?)"
+				atomic.AddInt32(&skip, 1)
+				if e.resumeState != nil {
+					e.resumeState.Processed = append(e.resumeState.Processed, a.SourcePath)
+					e.resumeState.Progress++
+				}
 				mu.Unlock()
 				if e.progress != nil { e.progress.Increment(1) }
 				return
@@ -353,29 +458,52 @@ func (e *Executor) Execute(ctx context.Context, actions []*types.RenameAction) (
 				a.Error = err.Error()
 				atomic.AddInt32(&fail, 1)
 				result.Warnings = append(result.Warnings, fmt.Sprintf("%s -> %s: %v", a.SourcePath, a.TargetPath, err))
+				if e.resumeState != nil {
+					e.resumeState.Failed = append(e.resumeState.Failed, a.SourcePath)
+					e.resumeState.Progress++
+				}
 				mu.Unlock()
 			} else {
 				a.Executed = true
 				a.Success = true
 				atomic.AddInt32(&succ, 1)
+				e.resumeMu.Lock()
+				if e.resumeState != nil {
+					e.resumeState.Processed = append(e.resumeState.Processed, a.SourcePath)
+					e.resumeState.Progress++
+				}
+				e.resumeMu.Unlock()
 			}
 			if e.progress != nil { e.progress.Increment(1) }
 		}()
 	}
 	wg.Wait()
 
+	close(saveTrigger)
+	time.Sleep(100 * time.Millisecond)
+	e.saveResumeCheckpoint(true)
+
 	result.Succeeded = int(atomic.LoadInt32(&succ))
 	result.Failed = int(atomic.LoadInt32(&fail))
 	result.Skipped = int(atomic.LoadInt32(&skip))
+	result.Interrupted = atomic.LoadInt32(&interrupted) == 1
 	result.Elapsed = time.Since(result.Elapsed)
 	if e.progress != nil { e.progress.Finish() }
 
 	if !dryRun && result.Succeeded > 0 {
 		hm, err := history.NewHistoryManager(e.cfg.Global.HistoryFile, e.cfg.Global.HistoryLimit)
 		if err == nil {
-			id, err := hm.Record(actions)
-			if err == nil {
-				result.HistoryID = id
+			successActions := make([]*types.RenameAction, 0, result.Succeeded)
+			for _, a := range actions {
+				if a.Success && a.Executed {
+					successActions = append(successActions, a)
+				}
+			}
+			if len(successActions) > 0 {
+				id, err := hm.Record(successActions)
+				if err == nil {
+					result.HistoryID = id
+				}
 			}
 		}
 	}
@@ -410,9 +538,17 @@ func NewResumeManager(path string) *ResumeManager {
 
 func (rm *ResumeManager) Save(state *types.ResumeState) error {
 	if state == nil { return nil }
+	dir := filepath.Dir(rm.path)
+	if dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil { return err }
-	return os.WriteFile(rm.path, data, 0644)
+	tmp := rm.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, rm.path)
 }
 
 func (rm *ResumeManager) Load() (*types.ResumeState, error) {
@@ -425,6 +561,10 @@ func (rm *ResumeManager) Load() (*types.ResumeState, error) {
 
 func (rm *ResumeManager) Clear() error {
 	if err := os.Remove(rm.path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	tmp := rm.path + ".tmp"
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
